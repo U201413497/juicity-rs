@@ -1,5 +1,7 @@
 # Juicity-RS
 
+> **Languages:** [English](README.md) | [简体中文](README-zh_hans.md)
+
 A Rust implementation of the [Juicity](https://github.com/juicity/juicity) protocol — a QUIC-based proxy that improves on TUIC's UDP handling with **UDP over Stream**, multiplexing UDP traffic over bidirectional QUIC streams.
 
 ## Features
@@ -7,7 +9,7 @@ A Rust implementation of the [Juicity](https://github.com/juicity/juicity) proto
 - **QUIC-based transport** — built on [`quinn`](https://github.com/quinn-rs/quinn) v0.11
 - **SOCKS5 and HTTP CONNECT proxy** — local proxy server with full SOCKS5 (CONNECT + UDP ASSOCIATE) and HTTP CONNECT support
 - **TCP/UDP port forwarding** — forward local ports to remote targets through the QUIC connection, with per-entry protocol filter (`/tcp`, `/udp`, or both)
-- **Configurable congestion control** — BBR (default), CUBIC, or NewReno; applies to both client and server
+- **Configurable congestion control** — BBR (default), CUBIC, or NewReno; applies to both client and server (see [Congestion Control](#congestion-control))
 - **Full-cone NAT UDP** — underlay UDP encrypted with ChaCha20-Poly1305 (HKDF-SHA1), compatible with the Go version
 - **TLS authentication** — RFC 5705 Export Keying Material, identical algorithm to upstream
 - **Certificate pinning** — `pinned_certchain_sha256` (accepts base64 or hex)
@@ -182,9 +184,37 @@ juicity-server export -c server.json --json-client --socks-port 1080
 juicity://<uuid>:<password>@<host>:<port>?sni=<sni>&congestion_control=<cc>&allow_insecure=<0|1>&pinned_certchain_sha256=<hash>
 ```
 
+## Congestion Control
+
+The QUIC connection between client and server uses an end-to-end congestion control algorithm selected via the `congestion_control` field (`"bbr"`, `"cubic"`, or `"newreno"`). All three only affect the network link between the proxy endpoints — they do not change the application, UDP, or TLS behaviour.
+
+### Comparison
+
+| Algorithm | Feedback used | Congestion reaction | Best suited for |
+|-----------|---------------|---------------------|-----------------|
+| **NewReno** | loss (AIMD) | additive increase, multiplicative decrease; window halves on loss | Lowest common denominator; most conservative & fair, slow to ramp up bandwidth |
+| **CUBIC** | loss (time-based cubic function) | window grows along a cubic curve over time, not RTT | High bandwidth-delay-product links, co-existing with standard TCP, best-effort fairness |
+| **BBR** (default) | measured bottleneck bandwidth & RTT | paces sending rate to measured available bandwidth; does not blindly shrink on loss | Lossy / high-RTT / variable networks (e.g. cross-border wireless); best throughput & latency |
+
+### Details
+
+- **NewReno** — the classic *additive increase, multiplicative decrease* (AIMD) scheme. It adds roughly one segment per RTT and halves the congestion window on packet loss, then enters fast recovery. Its simple, provably fair behaviour is very compatible with other congestion-aware traffic, but it ramps up throughput slowly and under-utilises high-bandwidth links.
+- **CUBIC** — grows the congestion window along a **cubic** (third-degree) curve that depends only on the time since the last loss, not on RTT. After a loss it quickly grows back toward the previous window, then probes for additional bandwidth more smoothly. This gives much higher utilisation on long, high-RTT links than Reno while remaining reasonably fair to competing flows.
+- **BBR** — rather than using loss as feedback, BBR periodically estimates the **bottleneck bandwidth (BtlBw/BDP)** and the **round-trip propagation time (RTprop)** and sets its sending rate from those measurements. Because it does not shrink the window in response to loss, it keeps throughput high on lossy or "buffer-bloated" links, giving the best latency and throughput in practice — which is why it is the default here.
+
+> **Note:** In this implementation the default BBR additionally sets an initial window of `10 × ETHERNET_MTU` bytes for faster convergence (`common/src/consts.rs`).
+
+### Which should I choose?
+
+- Default to **`bbr`** for the best cross-network stability and throughput, especially on lossy or congested paths.
+- Use **`cubic`** if you share a link with standard TCP traffic and want fairer coexistence.
+- Use **`newreno`** for maximum conservatism and best effort-goodput compatibility in mixed environments.
+
 ## Protocol
 
-Juicity extends the TUIC protocol with **UDP over Stream** — UDP datagrams are multiplexed over bidirectional QUIC streams, avoiding the per-datagram stream overhead of TUIC and the retransmission storm of native UDP mode.
+Juicity is a **modification built on top of native TUIC**: Juicity extends the TUIC protocol with **UDP over Stream** — UDP datagrams are multiplexed over bidirectional QUIC streams, avoiding the per-datagram stream overhead of TUIC and the retransmission storm of native UDP mode.
+
+> **About UDP over Stream and TUIC:** Native TUIC (the `tuic-protocol/tuic` spec) relays UDP over plain QUIC datagrams / UDP sockets and does **not** define a "UDP over Stream" mode. Later **mihomo** and **sing-box** server/client implementations added their own *compatible-in-name-only* "UDP over stream" / `udp_over_stream` extensions — these are separate add-on protocols (e.g. sing-box documents `udp_over_stream` as a port of "UDP over TCP", and it conflicts with `udp_relay_mode`), mutually incompatible with Juicity's wire format. The UDP-over-Stream framing in this project follows the **Juicity** protocol and is only interoperable between Juicity endpoints.
 
 ### Wire Format (TUIC-compatible)
 
