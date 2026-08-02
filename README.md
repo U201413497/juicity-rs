@@ -45,7 +45,7 @@ cargo build --release
 
 ## Configuration
 
-Both binaries share the same JSON config format. Unknown fields are ignored; missing fields fall back to their defaults.
+The server and client each use their own JSON config format (see below). Both share the common `congestion_control` and `log_level` fields. Unknown fields are ignored; missing fields fall back to their defaults.
 
 ### Server (`server.json`)
 

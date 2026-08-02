@@ -45,7 +45,7 @@ cargo build --release
 
 ## 配置
 
-两个可执行文件共用同一份 JSON 配置格式。未知字段会被忽略；缺失字段会回退到默认值。
+服务端与客户端各自使用不同的 JSON 配置文件（server.json 与 client.json）。两者共用 `congestion_control` 与 `log_level` 两个字段。未知字段会被忽略；缺失字段会回退到默认值。
 
 ### 服务端（`server.json`）
 
