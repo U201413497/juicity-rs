@@ -9,6 +9,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use juicity_common::cert;
 use juicity_common::config::Config;
@@ -87,9 +88,16 @@ enum Commands {
         domain: Option<String>,
 
         /// Enable to include pinned_certchain_sha256 in the share link,
-        /// computed from the server's certificate file.
+        /// computed from the server's certificate file (single cert SHA256, hex).
+        /// Kept for backward compatibility; prefer --with-certchain-sha256.
         #[arg(long = "with-cert-sha256", default_value_t = false)]
         with_cert_sha256: bool,
+
+        /// Enable to include pinned_certchain_sha256 in the share link,
+        /// computed from the full certificate chain (Go-compatible chain hash,
+        /// base64url encoded).
+        #[arg(long = "with-certchain-sha256", default_value_t = false)]
+        with_certchain_sha256: bool,
     },
 }
 
@@ -183,6 +191,7 @@ async fn run() -> anyhow::Result<()> {
             interface,
             domain,
             with_cert_sha256,
+            with_certchain_sha256,
         } => {
             let config = Config::from_file(&config)?;
 
@@ -192,24 +201,78 @@ async fn run() -> anyhow::Result<()> {
             let do_link = do_link || default_mode;
 
             // Compute certificate SHA256 if requested
-            let cert_sha256_override = if with_cert_sha256 {
-                if config.certificate.is_empty() {
-                    eprintln!(
-                        "Warning: --with-cert-sha256 specified but no certificate path in config"
-                    );
-                    None
-                } else {
-                    match compute_cert_sha256(&config.certificate) {
-                        Ok(hash) => Some(hash),
-                        Err(e) => {
-                            eprintln!("Warning: failed to compute certificate SHA256: {}", e);
-                            None
-                        }
+            let cert_sha256_override = if with_cert_sha256 && !config.certificate.is_empty() {
+                match compute_cert_sha256(&config.certificate) {
+                    Ok(hash) => Some(hash),
+                    Err(e) => {
+                        eprintln!("Warning: failed to compute certificate SHA256: {}", e);
+                        None
+                    }
+                }
+            } else if with_certchain_sha256 && !config.certificate.is_empty() {
+                match compute_cert_chain_hash(&config.certificate) {
+                    Ok(hash) => Some(hash),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to compute certificate chain SHA256: {}",
+                            e
+                        );
+                        None
                     }
                 }
             } else {
                 None
             };
+
+            // If neither flag is set and cert path is configured, check trust
+            // and prompt whether to pin the cert chain hash (like Go version).
+            let auto_pinned = if !with_cert_sha256
+                && !with_certchain_sha256
+                && do_link
+                && !config.certificate.is_empty()
+            {
+                match is_cert_trusted(&config.certificate) {
+                    Ok(true) => {
+                        // Trusted by system CA — no pinning needed
+                        None
+                    }
+                    Ok(false) => {
+                        eprintln!(
+                            "\nWarning: the certificate is NOT trusted by system CA roots."
+                        );
+                        eprintln!(
+                            "This usually means it is a self-signed or custom CA certificate."
+                        );
+                        if dialoguer::Confirm::new()
+                            .with_prompt("Include pinned_certchain_sha256 in the share link?")
+                            .default(true)
+                            .interact()?
+                        {
+                            match compute_cert_chain_hash(&config.certificate) {
+                                Ok(hash) => Some(hash),
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: failed to compute certificate chain SHA256: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: could not verify certificate trust: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let cert_sha256_override =
+                cert_sha256_override.or(auto_pinned);
 
             if do_link || qrcode || qrcode_png.is_some() {
                 // Step 1: Resolve hosts (from --interface or interactive multi-selection)
@@ -525,4 +588,93 @@ fn compute_cert_sha256(cert_path: &str) -> anyhow::Result<String> {
     let hash = hasher.finalize();
 
     Ok(hex::encode(hash))
+}
+
+// ── Certificate Chain Hash (Go-compatible) ──
+
+/// Read a PEM certificate file containing one or more certificates and compute
+/// the Go-compatible certificate chain SHA-256 hash.
+///
+/// The algorithm (same as Go `common.GenerateCertChainHash`):
+///   1. For each cert in the chain: `h_i = SHA256(der_bytes_i)`
+///   2. Chain: `chain = h_0; chain = SHA256(chain || h_i)` for i > 0
+///   3. Return base64url-encoded chain hash.
+///
+/// This matches the output of `juicity-server generate-certchain-hash`.
+fn compute_cert_chain_hash(cert_path: &str) -> anyhow::Result<String> {
+    use std::fs;
+
+    let data = fs::read(cert_path)?;
+    let mut reader = std::io::BufReader::new(&data[..]);
+
+    // Collect all DER certificates from the PEM file
+    let raw_certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|c| c.to_vec())
+        .collect();
+
+    if raw_certs.is_empty() {
+        anyhow::bail!("No certificates found in {}", cert_path);
+    }
+
+    // Convert to &[&[u8]] for generate_cert_chain_hash
+    let cert_refs: Vec<&[u8]> = raw_certs.iter().map(|c| c.as_slice()).collect();
+    let hash = juicity_common::crypto::generate_cert_chain_hash(&cert_refs);
+
+    Ok(base64::engine::general_purpose::URL_SAFE.encode(&hash))
+}
+
+// ── Certificate Trust Verification ──
+
+/// Check whether the leaf certificate in the PEM file is trusted by the
+/// system's CA certificate roots (Mozilla root store).
+///
+/// Returns `Ok(true)` if trusted, `Ok(false)` if not trusted (e.g. self-signed),
+/// or `Err(...)` if the certificate cannot be parsed.
+fn is_cert_trusted(cert_path: &str) -> anyhow::Result<bool> {
+    use rustls::client::verify_server_cert_signed_by_trust_anchor;
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::UnixTime;
+    use rustls::server::ParsedCertificate;
+    use rustls::RootCertStore;
+    use webpki_roots::TLS_SERVER_ROOTS;
+
+    let data = std::fs::read(cert_path)?;
+    let mut reader = std::io::BufReader::new(&data[..]);
+
+    let certs_der: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if certs_der.is_empty() {
+        anyhow::bail!("No certificates found in {}", cert_path);
+    }
+
+    let (leaf_der, intermediates) = certs_der.split_first().unwrap();
+
+    // Parse the end-entity certificate
+    let parsed_cert = ParsedCertificate::try_from(leaf_der)
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {:?}", e))?;
+
+    // Build root cert store from Mozilla roots
+    let mut root_store = RootCertStore::empty();
+    root_store
+        .roots
+        .extend(TLS_SERVER_ROOTS.iter().cloned());
+
+    // Supported signature algorithms
+    let supported_algs = rustls::crypto::aws_lc_rs::default_provider()
+        .signature_verification_algorithms
+        .all;
+
+    // Verify the certificate chain
+    let result = verify_server_cert_signed_by_trust_anchor(
+        &parsed_cert,
+        &root_store,
+        intermediates,
+        UnixTime::now(),
+        supported_algs,
+    );
+
+    Ok(result.is_ok())
 }
