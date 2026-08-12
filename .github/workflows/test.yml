@@ -1,0 +1,90 @@
+# ============================================
+# Juicity-RS Test Workflow
+# ============================================
+# Runs on push / pull_request. Splits the build into two groups and
+# only runs the one(s) affected by the changed paths:
+#   test_core — client / server / common (+ Cargo.toml / Cargo.lock / scripts / CI)
+#   test_gui  — gui (+ common / Cargo files / CI)
+# Both call the shared build workflow (.github/workflows/build.yml).
+# ============================================
+
+name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # --------------------------------------------------
+  # Detect which job groups are affected by the diff
+  # --------------------------------------------------
+  changes:
+    name: Detect Changed Paths
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      gui: ${{ steps.filter.outputs.gui }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Filter changed paths
+        id: filter
+        shell: bash
+        run: |
+          # Base commit to diff against
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+
+          # First push (no parent commit) — cannot diff, run everything
+          if [[ -z "$BASE" || "$BASE" == "0000000000000000000000000000000000000000" ]]; then
+            echo "core=true" >> "$GITHUB_OUTPUT"
+            echo "gui=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE" "$GITHUB_SHA" || true)
+
+          if grep -qE '^(common|client|server)/|^Cargo\.(toml|lock)$|^(build\.sh|build\.bat)$|^\.github/' <<<"$CHANGED"; then
+            echo "core=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "core=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if grep -qE '^gui/|^(common|client|server)/|^Cargo\.(toml|lock)$|^\.github/' <<<"$CHANGED"; then
+            echo "gui=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gui=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------
+  # Core build & test (client / server / common)
+  # --------------------------------------------------
+  test_core:
+    name: Test Core
+    needs: changes
+    if: needs.changes.outputs.core == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      build_targets: core
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # --------------------------------------------------
+  # GUI build & test
+  # --------------------------------------------------
+  test_gui:
+    name: Test GUI
+    needs: changes
+    if: needs.changes.outputs.gui == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      build_targets: gui
+      sha: ${{ github.sha }}
+    secrets: inherit

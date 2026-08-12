@@ -1,0 +1,66 @@
+# ============================================
+# Juicity-RS Release Workflow
+# ============================================
+# Runs when a GitHub Release is published.
+# Calls the shared build workflow with:
+#   - tag: the exact release tag (baked into `--version` output)
+#   - sha: the commit the release points to (baked into `--version` output)
+# Then attaches all artifacts to the Release.
+# ============================================
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  # --------------------------------------------------
+  # Build every target via the shared workflow
+  # --------------------------------------------------
+  build:
+    name: Build All Targets
+    uses: ./.github/workflows/build.yml
+    with:
+      build_targets: all
+      tag: ${{ github.event.release.tag_name }}
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # --------------------------------------------------
+  # Attach all artifacts to the GitHub Release
+  # --------------------------------------------------
+  publish:
+    name: Attach to Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Compress artifacts into zip files
+        shell: bash
+        run: |
+          shopt -s globstar
+          for dir in artifacts/*/; do
+            target_name=$(basename "$dir")
+            # The offline source package is already a .tar.gz — skip zipping
+            [[ "$target_name" == "juicity-offline-source" ]] && continue
+            zipfile="artifacts/${target_name}.zip"
+            echo "Creating zip: $zipfile from $dir"
+            (cd "$dir" && zip -ry "../../${zipfile}" .)
+          done
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/juicity-offline-source/juicity-offline-source.tar.gz
