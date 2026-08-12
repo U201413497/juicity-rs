@@ -1,24 +1,21 @@
 # ============================================
-# Juicity-RS Reusable Build Workflow
+# Juicity-RS Reusable Core Build Workflow
 # ============================================
-# Called via workflow_call from test.yml / release.yml.
-# Supported platforms:
+# Called via workflow_call from test-core.yml / release.yml.
+# The caller is responsible for running build-package.yml first
+# (this workflow consumes the juicity-offline-source artifact).
+# Builds client / server for all supported platforms:
 #   Linux  (glibc and musl, zigbuild): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
 #   Windows gnullvm (static): x86_64, aarch64  (via MSYS2 CLANG64/CLANGARM64)
 #   macOS        (native)  : x86_64, aarch64
 #   FreeBSD      (cross)   : x86_64
 # ============================================
 
-name: Build (reusable)
+name: Build Core (reusable)
 
 on:
   workflow_call:
     inputs:
-      build_targets:
-        description: Which job groups to run — 'core', 'gui' or 'all'
-        type: string
-        required: false
-        default: 'all'
       tag:
         description: Release tag baked into `--version` (empty = keep git-describe style)
         type: string
@@ -35,47 +32,9 @@ env:
 
 jobs:
   # --------------------------------------------------
-  # Package Offline Source Code
-  # --------------------------------------------------
-  package:
-    name: Package Offline Source Code
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag || '' }}
-
-      - name: Setup vendor for offline build
-        shell: bash
-        run: |
-          cargo vendor
-          mkdir -p .cargo
-          echo '[source.crates-io]
-          replace-with = "vendored-sources"
-
-          [source.vendored-sources]
-          directory = "vendor"' > .cargo/config.toml
-
-      - name: Create offline source package
-        shell: bash
-        run: |
-          # git archive (tracked source) + vendor/ + .cargo/config.toml
-          git archive --format=tar -o juicity-offline-source.tar HEAD
-          tar -rf juicity-offline-source.tar vendor/ .cargo/
-          gzip -f juicity-offline-source.tar
-
-      - name: Upload offline source artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: juicity-offline-source
-          path: juicity-offline-source.tar.gz
-
-  # --------------------------------------------------
   # Linux — zigbuild
   # --------------------------------------------------
   linux:
-    if: inputs.build_targets == 'core' || inputs.build_targets == 'all'
-    needs: package
     name: Linux (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ubuntu-26.04
     env:
@@ -170,8 +129,6 @@ jobs:
   # Windows gnullvm — static compile via MSYS2
   # --------------------------------------------------
   windows-gnullvm:
-    if: inputs.build_targets == 'core' || inputs.build_targets == 'all'
-    needs: package
     name: Windows gnullvm (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ${{ matrix.runner }}
     env:
@@ -251,8 +208,6 @@ jobs:
   # macOS — native build
   # --------------------------------------------------
   macos:
-    if: inputs.build_targets == 'core' || inputs.build_targets == 'all'
-    needs: package
     name: macOS (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     env:
@@ -308,8 +263,6 @@ jobs:
   # FreeBSD — cross build via actions-rust-cross
   # --------------------------------------------------
   freebsd:
-    if: inputs.build_targets == 'core' || inputs.build_targets == 'all'
-    needs: package
     name: FreeBSD x86_64${{ format(' - {0}', matrix.cpu_variant) }}
     runs-on: ubuntu-26.04
     env:
@@ -372,251 +325,4 @@ jobs:
         with:
           name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
           path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
-          if-no-files-found: error
-
-  # --------------------------------------------------
-  # GUI native build matrix
-  # --------------------------------------------------
-  gui:
-    if: inputs.build_targets == 'gui' || inputs.build_targets == 'all'
-    needs: package
-    name: GUI (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
-    env:
-      JUICITY_BUILD_TAG: ${{ inputs.tag }}
-      JUICITY_BUILD_COMMIT: ${{ inputs.sha }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            runner: ubuntu-26.04
-            target: x86_64-unknown-linux-gnu
-            ss_suffix: x86_64-unknown-linux-gnu.tar.xz
-            os: linux
-
-          - name: linux-aarch64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            ss_suffix: aarch64-unknown-linux-gnu.tar.xz
-            os: linux
-
-          - name: windows-x86_64
-            runner: windows-latest
-            target: x86_64-pc-windows-gnullvm
-            ss_suffix: x86_64-pc-windows-msvc.zip
-            msystem: CLANG64
-            msystem_arch: clang-x86_64
-            os: windows
-
-          # windows-aarch64 disabled: shadowsocks-rust has no aarch64-pc-windows binary yet
-          # - name: windows-aarch64
-          #   runner: windows-11-arm
-          #   target: aarch64-pc-windows-gnullvm
-          #   ss_suffix: aarch64-pc-windows-msvc.zip
-          #   msystem: CLANGARM64
-          #   msystem_arch: clang-aarch64
-          #   os: windows
-
-          - name: macos-x86_64
-            runner: macos-26-intel
-            target: x86_64-apple-darwin
-            ss_suffix: x86_64-apple-darwin.tar.xz
-            os: macos
-
-          - name: macos-aarch64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-            ss_suffix: aarch64-apple-darwin.tar.xz
-            os: macos
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Download offline source
-        uses: actions/download-artifact@v8
-        with:
-          name: juicity-offline-source
-
-      - name: Extract offline source
-        shell: bash
-        run: tar -xzf juicity-offline-source.tar.gz
-
-      # ── Install dependencies ─────────────────────────────────────────────
-      # GPUI needs libxkbcommon + libxkbcommon-x11, libwayland-client and
-      # libxcb at build time. The x11 development files live in a separate
-      # package (libxkbcommon-x11-dev) on Debian/Ubuntu. Vulkan (blade) is
-      # dlopen'd at runtime, not linked, so no vulkan dev packages are needed
-      # to build. macOS uses Metal and Windows uses native Win32/Direct3D, so
-      # no extra packages are needed.
-
-      - name: Install GPUI build deps (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev
-
-      - name: Install Rust toolchain (Linux/macOS)
-        if: matrix.os != 'windows'
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
-
-      - name: Setup MSYS2 (Windows)
-        if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@v2.31.1
-        with:
-          msystem: ${{ matrix.msystem }}
-          update: true
-          install: >-
-            mingw-w64-${{ matrix.msystem_arch }}-clang
-            mingw-w64-${{ matrix.msystem_arch }}-lld
-            mingw-w64-${{ matrix.msystem_arch }}-llvm
-            mingw-w64-${{ matrix.msystem_arch }}-rust
-
-      # ── Build ────────────────────────────────────────────────────────────
-
-      - name: Build (Linux/macOS)
-        if: matrix.os != 'windows'
-        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-server
-
-      - name: Build (Windows)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-server
-
-      # ── Test ────────────────────────────────────────────────────────────
-
-      - name: Run tests (Linux/macOS)
-        if: matrix.os != 'windows'
-        run: cargo test --frozen -p juicity-gui --target ${{ matrix.target }}
-
-      - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: |
-          unset LANG LC_ALL LC_MESSAGES
-          cargo test --frozen -p juicity-gui --target ${{ matrix.target }}
-
-      # ── Download shadowsocks-rust ─────────────────────────────────────────
-
-      - name: Get shadowsocks-rust latest tag
-        shell: bash
-        run: |
-          SS_TAG=$(curl -sSf \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
-          echo "Resolved shadowsocks-rust tag: ${SS_TAG}"
-          echo "SS_TAG=${SS_TAG}" >> "$GITHUB_ENV"
-
-      - name: Download shadowsocks-rust (Linux/macOS)
-        if: matrix.os != 'windows'
-        shell: bash
-        run: |
-          echo "Downloading shadowsocks-rust ${SS_TAG}"
-          curl -sSfL \
-            "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_TAG}/shadowsocks-${SS_TAG}.${{ matrix.ss_suffix }}" \
-            -o /tmp/ss.tar.xz
-          mkdir -p /tmp/ss
-          tar -xJf /tmp/ss.tar.xz -C /tmp/ss
-          echo "SS_DIR=/tmp/ss" >> "$GITHUB_ENV"
-
-      - name: Download shadowsocks-rust (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          Write-Host "Downloading shadowsocks-rust $env:SS_TAG"
-          $url = "https://github.com/shadowsocks/shadowsocks-rust/releases/download/$env:SS_TAG/shadowsocks-$env:SS_TAG.${{ matrix.ss_suffix }}"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ss.zip"
-          Expand-Archive -Path "$env:TEMP\ss.zip" -DestinationPath "$env:TEMP\ss" -Force
-          Add-Content $env:GITHUB_ENV "SS_DIR=$env:TEMP\ss"
-
-      # ── Prepare package ───────────────────────────────────────────────────
-
-      - name: Prepare package (Linux)
-        if: matrix.os == 'linux'
-        shell: bash
-        run: |
-          PKG_NAME="juicity-gui-${{ matrix.name }}"
-          mkdir -p "${PKG_NAME}"
-          cp "target/${{ matrix.target }}/release/juicity-gui"    "${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
-          cp "${SS_DIR}/sslocal" "${PKG_NAME}/"
-          cp "${SS_DIR}/ssurl"   "${PKG_NAME}/"
-          cp client/examples/config.json "${PKG_NAME}/client-config.json"
-
-      - name: Prepare .app bundle (macOS)
-        if: matrix.os == 'macos'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          # Derive version from the release tag (strip leading 'v');
-          # fall back to 0.1.0 for branch/PR builds (e.g. the test workflow).
-          VERSION="${RELEASE_TAG#v}"
-          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            VERSION="0.1.0"
-          fi
-          # Generate the .app bundle with all dependencies bundled inside
-          bash gui/macos/bundle.sh \
-            --target-dir "target/${{ matrix.target }}/release" \
-            --app-name "Juicity" \
-            --version "${VERSION}" \
-            --build-number "${{ github.run_number }}"
-          # The bundle.sh creates dist/Juicity.app
-          # Rename to include target name for artifact naming
-          mv dist/Juicity.app "dist/juicity-gui-${{ matrix.name }}.app"
-
-      - name: Prepare package + collect DLLs (Windows)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: |
-          PKG_NAME="juicity-gui-${{ matrix.name }}"
-          PKG_DIR="$(pwd)/${PKG_NAME}"
-          mkdir -p "${PKG_DIR}"
-
-          # Copy built binaries
-          cp "target/${{ matrix.target }}/release/juicity-gui.exe"    "${PKG_DIR}/"
-          cp "target/${{ matrix.target }}/release/juicity-client.exe" "${PKG_DIR}/"
-
-          # Copy shadowsocks-rust binaries (convert Windows path to MSYS2 path)
-          SS_UNIX=$(cygpath -u "${SS_DIR}")
-          cp "${SS_UNIX}/sslocal.exe" "${PKG_DIR}/"
-          cp "${SS_UNIX}/ssurl.exe"   "${PKG_DIR}/"
-
-          cp client/examples/config.json "${PKG_DIR}/client-config.json"
-
-          # Collect DLL dependencies recursively for all EXEs
-          declare -A seen
-          queue=("${PKG_DIR}/juicity-gui.exe" "${PKG_DIR}/juicity-client.exe")
-          while [[ ${#queue[@]} -gt 0 ]]; do
-            bin="${queue[0]}"; queue=("${queue[@]:1}")
-            [[ -f "$bin" ]] || continue
-            while IFS= read -r dll; do
-              name=$(basename "$dll")
-              [[ -n "${seen[$name]+x}" ]] && continue
-              seen[$name]=1
-              cp "$dll" "${PKG_DIR}/"
-              queue+=("${PKG_DIR}/${name}")
-            done < <(ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
-          done
-
-      # ── Upload artifact ───────────────────────────────────────────────────
-
-      - name: Upload artifact (Linux/Windows)
-        if: matrix.os != 'macos'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: juicity-gui-${{ matrix.name }}
-          path: juicity-gui-${{ matrix.name }}
-          if-no-files-found: error
-
-      - name: Upload artifact (macOS .app bundle)
-        if: matrix.os == 'macos'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: juicity-gui-${{ matrix.name }}.app
-          path: dist/juicity-gui-${{ matrix.name }}.app
           if-no-files-found: error

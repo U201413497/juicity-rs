@@ -2,9 +2,12 @@
 # Juicity-RS Release Workflow
 # ============================================
 # Runs when a GitHub Release is published.
-# Calls the shared build workflow with:
-#   - tag: the exact release tag (baked into `--version` output)
-#   - sha: the commit the release points to (baked into `--version` output)
+# Orchestrates the reusable workflows:
+#   1. build-package.yml — offline source packaging (checked out at the tag)
+#   2. build-core.yml    — core targets, with:
+#        tag: the exact release tag (baked into `--version` output)
+#        sha: the commit the release points to (baked into `--version` output)
+#   3. build-gui.yml     — GUI targets (same tag / sha)
 # Then attaches all artifacts to the Release.
 # ============================================
 
@@ -19,13 +22,35 @@ permissions:
 
 jobs:
   # --------------------------------------------------
-  # Build every target via the shared workflow
+  # Package Offline Source Code (at the release tag)
   # --------------------------------------------------
-  build:
-    name: Build All Targets
-    uses: ./.github/workflows/build.yml
+  package:
+    name: Package Offline Source Code
+    uses: ./.github/workflows/build-package.yml
     with:
-      build_targets: all
+      tag: ${{ github.event.release.tag_name }}
+    secrets: inherit
+
+  # --------------------------------------------------
+  # Build every target via the core build workflow
+  # --------------------------------------------------
+  build-core:
+    name: Build Core Targets
+    needs: package
+    uses: ./.github/workflows/build-core.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
+      sha: ${{ github.sha }}
+    secrets: inherit
+
+  # --------------------------------------------------
+  # Build every target via the GUI build workflow
+  # --------------------------------------------------
+  build-gui:
+    name: Build GUI Targets
+    needs: package
+    uses: ./.github/workflows/build-gui.yml
+    with:
       tag: ${{ github.event.release.tag_name }}
       sha: ${{ github.sha }}
     secrets: inherit
@@ -35,7 +60,7 @@ jobs:
   # --------------------------------------------------
   publish:
     name: Attach to Release
-    needs: build
+    needs: [build-core, build-gui]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,0 +1,51 @@
+# ============================================
+# Juicity-RS GUI Test Workflow
+# ============================================
+# Runs on push / pull_request when GUI-related paths change:
+#   gui (+ its dependencies: common / client / server / Cargo files / CI)
+# Orchestrates the reusable workflows:
+#   1. build-package.yml — offline source packaging
+#   2. build-gui.yml     — GUI build & test (consumes the package artifact)
+# ============================================
+
+name: Test GUI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'gui/**'
+      - 'common/**'
+      - 'client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/**'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'gui/**'
+      - 'common/**'
+      - 'client/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/**'
+
+jobs:
+  # --------------------------------------------------
+  # Package Offline Source Code
+  # --------------------------------------------------
+  package:
+    name: Package Offline Source Code
+    uses: ./.github/workflows/build-package.yml
+    secrets: inherit
+
+  # --------------------------------------------------
+  # GUI build & test
+  # --------------------------------------------------
+  test_gui:
+    name: Test GUI
+    needs: package
+    uses: ./.github/workflows/build-gui.yml
+    with:
+      sha: ${{ github.sha }}
+    secrets: inherit
