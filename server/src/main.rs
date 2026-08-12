@@ -44,6 +44,10 @@ enum Commands {
         /// Log level
         #[arg(long = "log-level")]
         log_level: Option<String>,
+
+        /// Disable timestamps in log output
+        #[arg(long = "disable-timestamp")]
+        disable_timestamp: bool,
     },
 
     /// Export share link, QR code, or JSON config
@@ -141,18 +145,26 @@ async fn run() -> anyhow::Result<()> {
     };
 
     match command {
-        Commands::Run { config, log_level } => {
+        Commands::Run {
+            config,
+            log_level,
+            disable_timestamp,
+        } => {
             let config = Config::from_file(&config)?;
             config.validate_for_server()?;
 
             let log_level = log_level.unwrap_or(config.log_level.clone());
 
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(&log_level)),
-                )
-                .init();
+            let filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&log_level));
+            if disable_timestamp {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .without_time()
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
 
             tracing::info!("Juicity server starting...");
 

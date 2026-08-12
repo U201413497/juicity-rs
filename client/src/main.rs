@@ -49,6 +49,10 @@ enum Commands {
         /// Set fwmark on the client socket (Linux only)
         #[arg(long)]
         fwmark: Option<u32>,
+
+        /// Disable timestamps in log output
+        #[arg(long = "disable-timestamp")]
+        disable_timestamp: bool,
     },
 
     /// Export share link, QR code, or JSON config
@@ -119,6 +123,7 @@ async fn run() -> anyhow::Result<()> {
             config,
             log_level,
             fwmark,
+            disable_timestamp,
         } => {
             let mut config = Config::from_file(&config)?;
             if let Some(fwmark) = fwmark {
@@ -128,12 +133,16 @@ async fn run() -> anyhow::Result<()> {
 
             let log_level = log_level.unwrap_or(config.log_level.clone());
 
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new(&log_level)),
-                )
-                .init();
+            let filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&log_level));
+            if disable_timestamp {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .without_time()
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
 
             tracing::info!("Juicity client starting...");
 
