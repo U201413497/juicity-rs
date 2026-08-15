@@ -150,7 +150,8 @@ async fn run() -> anyhow::Result<()> {
             log_level,
             disable_timestamp,
         } => {
-            let config = Config::from_file(&config)?;
+            let config_path = config;
+            let config = Config::from_file(&config_path)?;
             config.validate_for_server()?;
 
             let log_level = log_level.unwrap_or(config.log_level.clone());
@@ -187,9 +188,19 @@ async fn run() -> anyhow::Result<()> {
                 });
             }
 
-            let srv = juicity_server::server::JuicityServer::new(&config).await?;
-            srv.serve_with_shutdown(&config.listen, shutdown_signal())
-                .await?;
+            let listen = config.listen.clone();
+            let srv = std::sync::Arc::new(juicity_server::server::JuicityServer::new(&config).await?);
+
+            // Watch for SIGHUP to hot-reload the `users` table from the same
+            // config file. Only `users` is reloaded; all other settings
+            // (listen address, TLS, transport params, etc.) require a restart.
+            #[cfg(unix)]
+            {
+                let srv_for_reload = srv.clone();
+                tokio::spawn(watch_reload_signal(srv_for_reload, config_path.clone()));
+            }
+
+            srv.serve_with_shutdown(&listen, shutdown_signal()).await?;
         }
 
         Commands::Export {
@@ -337,6 +348,49 @@ async fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Watch for SIGHUP and hot-reload the `users` table from `config_path`.
+///
+/// Only the user/password table is reloaded; the listen address, TLS
+/// certificate/key, transport parameters, and other settings are read once
+/// at startup and require a process restart to change.
+///
+/// On any failure (file unreadable, invalid JSON, invalid uuid, empty user
+/// list), the reload is aborted and the currently-running user table is
+/// left untouched — a bad edit to the config file will never take down a
+/// running server.
+#[cfg(unix)]
+async fn watch_reload_signal(
+    srv: std::sync::Arc<juicity_server::server::JuicityServer>,
+    config_path: String,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to install SIGHUP handler, hot-reload disabled: {e}");
+            return;
+        }
+    };
+
+    loop {
+        sighup.recv().await;
+        tracing::info!("received SIGHUP, reloading users from {}", config_path);
+
+        match Config::from_file(&config_path) {
+            Ok(new_config) => match srv.reload_users(&new_config) {
+                Ok(()) => tracing::info!("users table reloaded successfully"),
+                Err(e) => tracing::error!("users reload aborted: {e}"),
+            },
+            Err(e) => {
+                tracing::error!(
+                    "users reload aborted: failed to read/parse config file: {e}"
+                );
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
