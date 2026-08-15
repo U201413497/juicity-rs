@@ -16,6 +16,7 @@ description = "A QUIC-based proxy tool (Rust rewrite of juicity)"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
+arc-swap = "1"
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "tracing", "signal"] }
