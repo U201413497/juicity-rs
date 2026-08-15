@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex as StdMutex;
 
+use arc_swap::ArcSwap;
 use indexmap::IndexMap;
 use moka::sync::Cache;
 use std::net::SocketAddr;
@@ -63,7 +64,7 @@ fn create_reuseport_socket(
 }
 
 pub struct JuicityServer {
-    users: Arc<HashMap<Uuid, String>>,
+    users: Arc<ArcSwap<HashMap<Uuid, String>>>,
     server_config: quinn::ServerConfig,
     dialer: Arc<dyn crate::dialer::Dialer>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
@@ -183,7 +184,7 @@ impl JuicityServer {
         };
 
         Ok(Self {
-            users: Arc::new(users),
+            users: Arc::new(ArcSwap::from_pointee(users)),
             server_config,
             dialer,
             in_flight: Arc::new(crate::inflight::InFlightUnderlayKey::new(
@@ -198,6 +199,35 @@ impl JuicityServer {
             )),
             disable_outbound_udp443: config.disable_outbound_udp443,
         })
+    }
+
+    /// Hot-reload the `users` table (uuid -> password) from a freshly loaded
+    /// config, without rebinding sockets, renegotiating TLS, or affecting
+    /// existing connections. New authentications immediately observe the
+    /// updated table.
+    ///
+    /// Validation happens before the swap: if any uuid fails to parse, a
+    /// password is empty, or the resulting table would be empty, the
+    /// reload is aborted and the previous table is left untouched.
+    pub fn reload_users(&self, config: &Config) -> anyhow::Result<()> {
+        let mut new_users = HashMap::with_capacity(config.users.len());
+        for (id, password) in &config.users {
+            let uuid = Uuid::parse_str(id)
+                .map_err(|e| anyhow::anyhow!("invalid user uuid '{}': {}", id, e))?;
+            if password.is_empty() {
+                anyhow::bail!("password for user '{}' is empty", id);
+            }
+            new_users.insert(uuid, password.clone());
+        }
+        if new_users.is_empty() {
+            anyhow::bail!("reload aborted: 'users' would become empty");
+        }
+
+        let user_count = new_users.len();
+        self.users.store(Arc::new(new_users));
+
+        tracing::info!(user_count, "user table hot-reloaded");
+        Ok(())
     }
 
     pub async fn serve(&self, addr: &str) -> anyhow::Result<()> {
@@ -916,7 +946,7 @@ async fn handle_non_quic_underlay_packet(
 /// Handle an incoming QUIC connection
 async fn handle_connection(
     incoming: quinn::Incoming,
-    users: Arc<HashMap<Uuid, String>>,
+    users: Arc<ArcSwap<HashMap<Uuid, String>>>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     _udp_pool: Arc<crate::udp::UdpEndpointPool>,
     dialer: Arc<dyn crate::dialer::Dialer>,
@@ -1052,7 +1082,7 @@ async fn handle_connection(
 /// Format: [version=0][cmd_type=Authenticate(0x00)][uuid(16)][token(32)]
 async fn handle_auth(
     conn: &quinn::Connection,
-    users: Arc<HashMap<Uuid, String>>,
+    users: Arc<ArcSwap<HashMap<Uuid, String>>>,
 ) -> anyhow::Result<(Uuid, RecvStream)> {
     let mut uni_stream = conn.accept_uni().await?;
 
@@ -1066,10 +1096,16 @@ async fn handle_auth(
 
     let (uuid, received_token) = protocol::read_authenticate_async(&mut uni_stream).await?;
 
-    let password = users
-        .get(&uuid)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("unknown user: {}", uuid))?;
+    // Load a lock-free snapshot of the current user table. Any reload that
+    // happens concurrently is picked up by the *next* authentication attempt;
+    // this one completes against a consistent snapshot.
+    let password = {
+        let snapshot = users.load();
+        snapshot
+            .get(&uuid)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown user: {}", uuid))?
+    };
 
     // Verify token using TLS ExportKeyingMaterial (RFC 5705) - same as upstream.
     // export_keying_material is CPU-bound (HKDF); run it in spawn_blocking to
@@ -1338,36 +1374,6 @@ async fn handle_udp_relay(
     Ok(())
 }
 
-/// Resolve a UDP target address (hostname or IP) with DNS caching.
-///
-/// If `host` is already a valid [`IpAddr`], it is returned directly
-/// without DNS resolution.  Otherwise, the function performs an async DNS
-/// lookup via [`tokio::net::lookup_host`] and caches the first result in
-/// the provided `dns_cache` to avoid repeated queries for the same
-/// host/port pair within the [`consts::UDP_DNS_CACHE_TTL`] window.
-///
-/// The cache is behind a [`tokio::sync::Mutex`] so it can be shared across
-/// multiple UDP relay streams within the same QUIC connection.  The lock is
-/// held only briefly for cache lookups and inserts; the DNS lookup itself
-/// runs outside the critical section to avoid blocking other streams.
-///
-/// # Arguments
-///
-/// * `host` - The target hostname or IP address string.
-/// * `port` - The target UDP port.
-/// * `dns_cache` - A shared [`tokio::sync::Mutex`] wrapping an [`IndexMap`]
-///   that serves as a bounded DNS cache with TTL-based expiry.  When the
-///   cache reaches [`consts::MAX_UDP_DNS_CACHE`] entries, the oldest entry
-///   is evicted.
-///
-/// # Returns
-///
-/// A resolved [`SocketAddr`] suitable for use with `send_to`.
-///
-/// # Errors
-///
-/// Returns an error if DNS resolution fails (e.g. NXDOMAIN) or returns
-/// zero addresses.
 /// Resolve a UDP target address (hostname or IP) with DNS caching and
 /// per-key resolution locking to prevent duplicate concurrent lookups.
 ///
