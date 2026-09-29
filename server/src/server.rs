@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex as StdMutex;
 
+use arc_swap::ArcSwap;
 use indexmap::IndexMap;
 use moka::sync::Cache;
 use std::net::SocketAddr;
@@ -33,6 +34,15 @@ struct UnderlaySession {
     relay_abort: Option<tokio::task::AbortHandle>,
 }
 
+/// Outbound settings that can be swapped at runtime (hot reload).
+///
+/// `dialer` and `disable_udp443` live in one struct so that a single
+/// `ArcSwap::store` switches both atomically.
+pub struct Outbound {
+    dialer: Arc<dyn crate::dialer::Dialer>,
+    disable_udp443: bool,
+}
+
 /// Juicity proxy server
 /// Create a UDP socket with SO_REUSEPORT enabled (Unix only), optionally in
 /// dual-stack mode.
@@ -62,130 +72,160 @@ fn create_reuseport_socket(
     Ok(std::net::UdpSocket::from(sock))
 }
 
+/// Parse the `users` section of the config into a uuid -> password map.
+fn build_users(config: &Config) -> anyhow::Result<HashMap<Uuid, String>> {
+    let mut users = HashMap::new();
+    for (id, password) in &config.users {
+        let uuid = Uuid::parse_str(id)?;
+        users.insert(uuid, password.clone());
+    }
+    Ok(users)
+}
+
+/// Build the outbound (dialer + udp/443 policy) settings from the config.
+fn build_outbound(config: &Config) -> anyhow::Result<Outbound> {
+    let dialer: Arc<dyn crate::dialer::Dialer> = if !config.send_through.is_empty() {
+        let addr: std::net::IpAddr = config.send_through.parse()?;
+        Arc::new(crate::dialer::BindDialer { bind_addr: addr })
+    } else {
+        Arc::new(crate::dialer::DefaultDialer)
+    };
+    Ok(Outbound {
+        dialer,
+        disable_udp443: config.disable_outbound_udp443,
+    })
+}
+
+/// Build the quinn server config (TLS certificate/key, ALPN, 0-RTT,
+/// transport parameters and congestion control) from the config.
+///
+/// Shared by startup (`JuicityServer::new`) and hot reload.
+async fn build_server_config(config: &Config) -> anyhow::Result<quinn::ServerConfig> {
+    // Load TLS certificates and private key via spawn_blocking to avoid
+    // blocking the async runtime with synchronous file I/O.
+    let cert_path = config.certificate.clone();
+    let key_path = config.private_key.clone();
+    let (certs, key) = tokio::try_join!(
+        tokio::task::spawn_blocking(move || load_certs(&cert_path)),
+        tokio::task::spawn_blocking(move || load_private_key(&key_path)),
+    )?;
+    let certs = certs?;
+    let key = key?;
+
+    let mut tls_server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    // Juicity spec requires ALPN to be h3.
+    tls_server_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    // Enable 0-RTT (Early Data), allowing the client to send early data on reconnection
+    if config.enable_0rtt.unwrap_or(true) {
+        tls_server_config.max_early_data_size = u32::MAX;
+    }
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls_server_config)?,
+    ));
+
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // Set initial_rtt if configured
+    if let Some(initial_rtt_ms) = config.initial_rtt {
+        transport_config.initial_rtt(std::time::Duration::from_millis(initial_rtt_ms));
+    }
+
+    // Keep-alive is disabled by default so QUIC idle timeout / connection
+    // lifecycle management can release idle connections naturally.
+    // Enable only when explicitly configured.
+    if let Some(keep_alive_secs) = config.keep_alive_interval {
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive_secs)));
+    }
+
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
+        consts::MAX_OPEN_INCOMING_STREAMS as u32,
+    ));
+    transport_config
+        .max_concurrent_uni_streams(VarInt::from_u32(consts::MAX_OPEN_INCOMING_STREAMS as u32));
+    // Set an explicit idle timeout for defense-in-depth.
+    // Even with keep-alive enabled, if the peer stops responding or never opens
+    // a stream after authentication, this timeout ensures the connection and its
+    // associated resources (auth reader task, Arc references) are eventually released.
+    transport_config.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(consts::MAX_QUIC_IDLE_TIMEOUT)
+            .map_err(|e| anyhow::anyhow!("invalid idle timeout: {:?}", e))?,
+    ));
+    transport_config.stream_receive_window(VarInt::from_u32(consts::QUIC_STREAM_RECEIVE_WINDOW));
+    transport_config.receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW));
+    transport_config.send_window(consts::QUIC_SEND_WINDOW);
+
+    // Dynamically adjust window size based on initial_rtt
+    if let Some(rtt_ms) = config.initial_rtt {
+        if rtt_ms < 50 {
+            // Low latency: reduce window to save memory
+            transport_config.stream_receive_window(VarInt::from_u32(
+                consts::QUIC_STREAM_RECEIVE_WINDOW / 2,
+            ));
+            transport_config
+                .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW / 2));
+        } else if rtt_ms > 200 {
+            // High latency: increase window to improve throughput
+            transport_config.stream_receive_window(VarInt::from_u32(
+                consts::QUIC_STREAM_RECEIVE_WINDOW * 2,
+            ));
+            transport_config
+                .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW * 2));
+        }
+    }
+
+    match config.congestion_control.to_lowercase().as_str() {
+        "cubic" => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        "newreno" | "new_reno" => transport_config
+            .congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+        _ => {
+            // Tune BBR parameters: set a reasonable initial window to balance latency and throughput
+            let mut bbr_config = quinn::congestion::BbrConfig::default();
+            // Set initial congestion window (in bytes)
+            // Default is min(10*MTU, max(2*MTU, 14720)), here adjusted to 10*MTU
+            bbr_config.initial_window(10 * consts::ETHERNET_MTU as u64);
+            transport_config.congestion_controller_factory(Arc::new(bbr_config))
+        }
+    };
+    server_config.transport_config(Arc::new(transport_config));
+
+    Ok(server_config)
+}
+
 pub struct JuicityServer {
-    users: Arc<HashMap<Uuid, String>>,
-    server_config: quinn::ServerConfig,
-    dialer: Arc<dyn crate::dialer::Dialer>,
+    /// Hot-swappable user table (uuid -> password); read by `handle_auth`.
+    users: Arc<ArcSwap<HashMap<Uuid, String>>>,
+    /// Latest quinn server config; used to initialise endpoints in `serve`.
+    server_config: ArcSwap<quinn::ServerConfig>,
+    /// Hot-swappable outbound settings (dialer, udp/443 policy).
+    outbound: Arc<ArcSwap<Outbound>>,
+    /// Endpoints registered by `serve_with_shutdown`, so `reload` can call
+    /// `set_server_config` on every one of them.
+    endpoints: StdMutex<Vec<Endpoint>>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_endpoint_pool: Arc<crate::udp::UdpEndpointPool>,
-    disable_outbound_udp443: bool,
+    // The two fields below are only used by `reload` to detect changes to
+    // settings that cannot be applied without a restart.
+    listen: String,
+    underlay_evict_timeout: Option<u64>,
 }
 
 impl JuicityServer {
     pub async fn new(config: &Config) -> anyhow::Result<Self> {
-        let mut users = HashMap::new();
-        for (id, password) in &config.users {
-            let uuid = Uuid::parse_str(id)?;
-            users.insert(uuid, password.clone());
-        }
-
-        // Load TLS certificates and private key via spawn_blocking to avoid
-        // blocking the async runtime with synchronous file I/O.
-        let cert_path = config.certificate.clone();
-        let key_path = config.private_key.clone();
-        let (certs, key) = tokio::try_join!(
-            tokio::task::spawn_blocking(move || load_certs(&cert_path)),
-            tokio::task::spawn_blocking(move || load_private_key(&key_path)),
-        )?;
-        let certs = certs?;
-        let key = key?;
-
-        let mut tls_server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-
-        // Juicity spec requires ALPN to be h3.
-        tls_server_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        // Enable 0-RTT (Early Data), allowing the client to send early data on reconnection
-        if config.enable_0rtt.unwrap_or(true) {
-            tls_server_config.max_early_data_size = u32::MAX;
-        }
-
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls_server_config)?,
-        ));
-
-        let mut transport_config = quinn::TransportConfig::default();
-
-        // Set initial_rtt if configured
-        if let Some(initial_rtt_ms) = config.initial_rtt {
-            transport_config.initial_rtt(std::time::Duration::from_millis(initial_rtt_ms));
-        }
-
-        // Keep-alive is disabled by default so QUIC idle timeout / connection
-        // lifecycle management can release idle connections naturally.
-        // Enable only when explicitly configured.
-        if let Some(keep_alive_secs) = config.keep_alive_interval {
-            transport_config
-                .keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive_secs)));
-        }
-
-        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
-            consts::MAX_OPEN_INCOMING_STREAMS as u32,
-        ));
-        transport_config
-            .max_concurrent_uni_streams(VarInt::from_u32(consts::MAX_OPEN_INCOMING_STREAMS as u32));
-        // Set an explicit idle timeout for defense-in-depth.
-        // Even with keep-alive enabled, if the peer stops responding or never opens
-        // a stream after authentication, this timeout ensures the connection and its
-        // associated resources (auth reader task, Arc references) are eventually released.
-        transport_config.max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(consts::MAX_QUIC_IDLE_TIMEOUT)
-                .map_err(|e| anyhow::anyhow!("invalid idle timeout: {:?}", e))?,
-        ));
-        transport_config
-            .stream_receive_window(VarInt::from_u32(consts::QUIC_STREAM_RECEIVE_WINDOW));
-        transport_config.receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW));
-        transport_config.send_window(consts::QUIC_SEND_WINDOW);
-
-        // Dynamically adjust window size based on initial_rtt
-        if let Some(rtt_ms) = config.initial_rtt {
-            if rtt_ms < 50 {
-                // Low latency: reduce window to save memory
-                transport_config.stream_receive_window(VarInt::from_u32(
-                    consts::QUIC_STREAM_RECEIVE_WINDOW / 2,
-                ));
-                transport_config
-                    .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW / 2));
-            } else if rtt_ms > 200 {
-                // High latency: increase window to improve throughput
-                transport_config.stream_receive_window(VarInt::from_u32(
-                    consts::QUIC_STREAM_RECEIVE_WINDOW * 2,
-                ));
-                transport_config
-                    .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW * 2));
-            }
-        }
-
-        match config.congestion_control.to_lowercase().as_str() {
-            "cubic" => transport_config
-                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
-            "newreno" | "new_reno" => transport_config.congestion_controller_factory(Arc::new(
-                quinn::congestion::NewRenoConfig::default(),
-            )),
-            _ => {
-                // Tune BBR parameters: set a reasonable initial window to balance latency and throughput
-                let mut bbr_config = quinn::congestion::BbrConfig::default();
-                // Set initial congestion window (in bytes)
-                // Default is min(10*MTU, max(2*MTU, 14720)), here adjusted to 10*MTU
-                bbr_config.initial_window(10 * consts::ETHERNET_MTU as u64);
-                transport_config.congestion_controller_factory(Arc::new(bbr_config))
-            }
-        };
-        server_config.transport_config(Arc::new(transport_config));
-
-        let dialer: Arc<dyn crate::dialer::Dialer> = if !config.send_through.is_empty() {
-            let addr: std::net::IpAddr = config.send_through.parse()?;
-            Arc::new(crate::dialer::BindDialer { bind_addr: addr })
-        } else {
-            Arc::new(crate::dialer::DefaultDialer)
-        };
+        let users = build_users(config)?;
+        let server_config = build_server_config(config).await?;
+        let outbound = build_outbound(config)?;
 
         Ok(Self {
-            users: Arc::new(users),
-            server_config,
-            dialer,
+            users: Arc::new(ArcSwap::from_pointee(users)),
+            server_config: ArcSwap::from_pointee(server_config),
+            outbound: Arc::new(ArcSwap::from_pointee(outbound)),
+            endpoints: StdMutex::new(Vec::new()),
             in_flight: Arc::new(crate::inflight::InFlightUnderlayKey::new(
                 consts::IN_FLIGHT_UNDERLAY_TTL,
                 config
@@ -196,8 +236,58 @@ impl JuicityServer {
             udp_endpoint_pool: Arc::new(crate::udp::UdpEndpointPool::new(
                 consts::MAX_UDP_ENDPOINTS as u64,
             )),
-            disable_outbound_udp443: config.disable_outbound_udp443,
+            listen: config.listen.clone(),
+            underlay_evict_timeout: config.underlay_evict_timeout,
         })
+    }
+
+    /// Hot reload: apply a freshly parsed config without dropping connections.
+    ///
+    /// Everything that can fail (validation, parsing users, reading the
+    /// certificate/key, building the quinn config, building the dialer) is
+    /// done first. Only when all of it succeeded are the new values swapped
+    /// in, so a failed reload leaves the previous configuration untouched.
+    ///
+    /// Effect:
+    /// * `users`                         – used by the next authentication
+    /// * `certificate` / `private_key`,
+    ///   congestion control, transport
+    ///   parameters, 0-RTT               – new QUIC connections only
+    /// * `send_through`,
+    ///   `disable_outbound_udp443`       – new streams / new underlay sessions
+    /// * `listen`, `underlay_evict_timeout` – need a restart (warning only)
+    ///
+    /// Established connections, streams and UDP sessions are not touched.
+    pub async fn reload(&self, config: &Config) -> anyhow::Result<()> {
+        config.validate_for_server()?;
+
+        let users = build_users(config)?;
+        let server_config = Arc::new(build_server_config(config).await?);
+        let outbound = build_outbound(config)?;
+
+        if config.listen != self.listen {
+            tracing::warn!(
+                "`listen` changed; a restart is required, still listening on {}",
+                self.listen
+            );
+        }
+        if config.underlay_evict_timeout != self.underlay_evict_timeout {
+            tracing::warn!("`underlay_evict_timeout` changed; a restart is required, ignoring");
+        }
+
+        {
+            // No `.await` while this lock is held.
+            let endpoints = self.endpoints.lock().unwrap();
+            self.server_config.store(server_config.clone());
+            for ep in endpoints.iter() {
+                // Only affects connections accepted from now on.
+                ep.set_server_config(Some((*server_config).clone()));
+            }
+        }
+        self.users.store(Arc::new(users));
+        self.outbound.store(Arc::new(outbound));
+
+        Ok(())
     }
 
     pub async fn serve(&self, addr: &str) -> anyhow::Result<()> {
@@ -238,6 +328,10 @@ impl JuicityServer {
         let (underlay_tx, underlay_rx) =
             tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
 
+        // Snapshot of the newest quinn server config (a reload may already
+        // have happened between `new()` and now).
+        let initial_cfg: quinn::ServerConfig = (*self.server_config.load_full()).clone();
+
         #[cfg(unix)]
         let (server_underlay_socket, endpoints, num_sockets) = {
             let num_sockets = std::thread::available_parallelism()
@@ -263,7 +357,7 @@ impl JuicityServer {
                 ));
                 let endpoint = Endpoint::new_with_abstract_socket(
                     EndpointConfig::default(),
-                    Some(self.server_config.clone()),
+                    Some(initial_cfg.clone()),
                     demux,
                     runtime.clone(),
                 )?;
@@ -290,12 +384,25 @@ impl JuicityServer {
             ));
             let endpoint = Endpoint::new_with_abstract_socket(
                 EndpointConfig::default(),
-                Some(self.server_config.clone()),
+                Some(initial_cfg.clone()),
                 demux,
                 runtime.clone(),
             )?;
             (server_underlay_socket, vec![endpoint])
         };
+
+        // Register the endpoints so `reload()` can update their server config.
+        // The newest config is loaded *after* taking the lock (reload stores
+        // it while holding the same lock), so a reload racing with startup
+        // can never leave the endpoints on a stale config.
+        {
+            let mut guard = self.endpoints.lock().unwrap();
+            let latest = self.server_config.load_full();
+            for ep in &endpoints {
+                ep.set_server_config(Some((*latest).clone()));
+            }
+            *guard = endpoints.clone();
+        }
 
         #[cfg(unix)]
         tracing::info!(
@@ -323,7 +430,7 @@ impl JuicityServer {
 
         let underlay_in_flight = self.in_flight.clone();
         let underlay_udp_pool = self.udp_endpoint_pool.clone();
-        let underlay_disable_443 = self.disable_outbound_udp443;
+        let underlay_outbound = self.outbound.clone();
         let underlay_socket = server_underlay_socket.clone();
         // The underlay loop self-terminates when underlay_rx closes (all endpoints dropped),
         // but AbortOnDrop ensures it is also cancelled on any early serve() exit.
@@ -334,7 +441,7 @@ impl JuicityServer {
                     underlay_in_flight,
                     underlay_udp_pool,
                     underlay_socket,
-                    underlay_disable_443,
+                    underlay_outbound,
                 )
                 .await;
             })
@@ -360,8 +467,7 @@ impl JuicityServer {
             let users = self.users.clone();
             let in_flight = self.in_flight.clone();
             let udp_pool = self.udp_endpoint_pool.clone();
-            let dialer = self.dialer.clone();
-            let disable_443 = self.disable_outbound_udp443;
+            let outbound = self.outbound.clone();
             let mut accept_shutdown = shutdown_rx.clone();
 
             let accept_handle = tokio::spawn(async move {
@@ -398,8 +504,7 @@ impl JuicityServer {
                             let users = users.clone();
                             let in_flight = in_flight.clone();
                             let udp_pool = udp_pool.clone();
-                            let dialer = dialer.clone();
-                            let disable_443 = disable_443;
+                            let outbound = outbound.clone();
 
                             conn_tasks.spawn(async move {
                                 let _permit = permit;
@@ -408,8 +513,7 @@ impl JuicityServer {
                                     users,
                                     in_flight,
                                     udp_pool,
-                                    dialer,
-                                    disable_443,
+                                    outbound,
                                 )
                                 .await
                                 {
@@ -448,6 +552,10 @@ impl JuicityServer {
         // Wait until shutdown is requested by the caller.
         shutdown.await;
         tracing::info!("shutdown requested: stopping accept loops");
+
+        // Release the endpoint clones held for hot reload, so the sockets are
+        // closed as soon as the accept workers drop their own endpoint.
+        self.endpoints.lock().unwrap().clear();
 
         // 1) Stop accepting new connections.
         let _ = shutdown_tx.send(true);
@@ -496,7 +604,9 @@ impl JuicityServer {
 /// * `udp_pool` - Shared UDP endpoint pool for full-cone NAT.
 /// * `server_socket` - The server's main UDP socket, used for relay-back
 ///   traffic to clients.
-/// * `disable_udp_443` - When `true`, outbound UDP to port 443 is blocked.
+/// * `outbound` - Hot-swappable outbound settings; the current value of
+///   `disable_udp443` is read for every new (slow-path) packet, so a reload
+///   takes effect for new underlay sessions.
 ///
 /// # Lifespan
 ///
@@ -508,7 +618,7 @@ async fn run_underlay_packet_loop(
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
     server_socket: Arc<tokio::net::UdpSocket>,
-    disable_udp_443: bool,
+    outbound: Arc<ArcSwap<Outbound>>,
 ) {
     // ══ Moka cache for underlay sessions ══════════════════════════════════
     // Uses moka::sync::Cache with:
@@ -574,6 +684,8 @@ async fn run_underlay_packet_loop(
         }
 
         // ── Slow path: new session or recovery → spawn task for async auth/endpoint creation ──
+        // Read the current policy here so a hot reload applies to new sessions.
+        let disable_udp_443 = outbound.load().disable_udp443;
         let permit = concurrency_limit.clone().acquire_owned().await;
         let in_flight = in_flight.clone();
         let udp_pool = udp_pool.clone();
@@ -916,11 +1028,10 @@ async fn handle_non_quic_underlay_packet(
 /// Handle an incoming QUIC connection
 async fn handle_connection(
     incoming: quinn::Incoming,
-    users: Arc<HashMap<Uuid, String>>,
+    users: Arc<ArcSwap<HashMap<Uuid, String>>>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     _udp_pool: Arc<crate::udp::UdpEndpointPool>,
-    dialer: Arc<dyn crate::dialer::Dialer>,
-    disable_udp_443: bool,
+    outbound: Arc<ArcSwap<Outbound>>,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
@@ -932,7 +1043,8 @@ async fn handle_connection(
 
     // === Authenticate ===
     let auth_conn = connection.clone();
-    let auth_users = users.clone();
+    // Snapshot of the user table at the moment this connection authenticates.
+    let auth_users = users.load_full();
 
     let auth_result = tokio::time::timeout(consts::AUTHENTICATE_TIMEOUT, async {
         handle_auth(&auth_conn, auth_users).await
@@ -1004,9 +1116,12 @@ async fn handle_connection(
 
         match connection.accept_bi().await {
             Ok((send_stream, recv_stream)) => {
-                let s_dialer = dialer.clone();
+                // Pick up the current outbound settings for every new stream so
+                // a hot reload (send_through, udp/443 policy) applies to it.
+                let ob = outbound.load_full();
+                let s_dialer = ob.dialer.clone();
                 let s_user_uuid = user_uuid;
-                let s_disable_443 = disable_udp_443;
+                let s_disable_443 = ob.disable_udp443;
                 let s_dns_cache = dns_cache.clone();
                 let s_dns_resolving = dns_resolving.clone();
 
