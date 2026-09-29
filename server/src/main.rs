@@ -9,6 +9,8 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::sync::Arc;
+
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use juicity_common::cert;
@@ -146,25 +148,56 @@ async fn run() -> anyhow::Result<()> {
 
     match command {
         Commands::Run {
-            config,
-            log_level,
+            config: config_path,
+            log_level: cli_log_level,
             disable_timestamp,
         } => {
-            let config = Config::from_file(&config)?;
+            // The config file is re-read on SIGHUP, and under systemd the
+            // working directory is not what the user typed the path relative
+            // to, so resolve it to an absolute path once, up front.
+            let config_path = std::fs::canonicalize(&config_path)?
+                .to_string_lossy()
+                .into_owned();
+
+            let config = Config::from_file(&config_path)?;
             config.validate_for_server()?;
 
-            let log_level = log_level.unwrap_or(config.log_level.clone());
+            let log_level = cli_log_level
+                .clone()
+                .unwrap_or_else(|| config.log_level.clone());
+
+            // If the log level was pinned explicitly (--log-level or RUST_LOG),
+            // a reload must not override it.
+            #[allow(unused_variables)]
+            let log_follows_config =
+                cli_log_level.is_none() && std::env::var_os("RUST_LOG").is_none();
 
             let filter = EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(&log_level));
-            if disable_timestamp {
-                tracing_subscriber::fmt()
+
+            // The two builders have different types, so wrap the reload
+            // handle in a boxed closure to get a single type.
+            #[allow(unused_variables)]
+            let set_log_level: Box<dyn Fn(&str) + Send + Sync> = if disable_timestamp {
+                let builder = tracing_subscriber::fmt()
                     .with_env_filter(filter)
                     .without_time()
-                    .init();
+                    .with_filter_reloading();
+                let handle = builder.reload_handle();
+                builder.init();
+                Box::new(move |lvl: &str| {
+                    let _ = handle.reload(EnvFilter::new(lvl));
+                })
             } else {
-                tracing_subscriber::fmt().with_env_filter(filter).init();
-            }
+                let builder = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_filter_reloading();
+                let handle = builder.reload_handle();
+                builder.init();
+                Box::new(move |lvl: &str| {
+                    let _ = handle.reload(EnvFilter::new(lvl));
+                })
+            };
 
             tracing::info!("Juicity server starting...");
 
@@ -187,7 +220,48 @@ async fn run() -> anyhow::Result<()> {
                 });
             }
 
-            let srv = juicity_server::server::JuicityServer::new(&config).await?;
+            // Register the SIGHUP handler *before* the server is built, so a
+            // SIGHUP arriving during startup is queued instead of hitting the
+            // default action (terminate the process).
+            #[cfg(unix)]
+            let mut hup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+            let srv = Arc::new(juicity_server::server::JuicityServer::new(&config).await?);
+
+            // Hot reload on SIGHUP (`systemctl reload juicity-server`).
+            // A failed reload keeps the previous configuration.
+            #[cfg(unix)]
+            {
+                let srv = srv.clone();
+                let path = config_path.clone();
+                tokio::spawn(async move {
+                    while hup.recv().await.is_some() {
+                        tracing::info!("received SIGHUP, reloading {}", path);
+                        let result = async {
+                            let cfg = Config::from_file(&path)?;
+                            srv.reload(&cfg).await?;
+                            Ok::<_, anyhow::Error>(cfg)
+                        }
+                        .await;
+                        match result {
+                            Ok(cfg) => {
+                                if log_follows_config {
+                                    set_log_level(&cfg.log_level);
+                                }
+                                tracing::info!("configuration reloaded");
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "reload failed, keeping previous configuration: {:#}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+
             srv.serve_with_shutdown(&config.listen, shutdown_signal())
                 .await?;
         }
